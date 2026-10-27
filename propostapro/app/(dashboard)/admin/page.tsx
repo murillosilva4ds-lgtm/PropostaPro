@@ -44,8 +44,8 @@ export default async function AdminPage() {
     : 0;
 
   // Taxa de aprovação
-  const taxaAprovacao = (propostas ?? []).length > 0 
-    ? ((aprovadas / (propostas ?? []).length) * 100).toFixed(1)
+  const taxaAprovacaoNum = (propostas ?? []).length > 0 
+    ? Number(((aprovadas / (propostas ?? []).length) * 100).toFixed(1))
     : 0;
 
   // Dados para gráficos
@@ -63,9 +63,9 @@ export default async function AdminPage() {
   // Passar dados para o Client Component
   return (
     <AdminDashboardClient
-      totalUsuarios={totalUsuarios}
-      totalPropostas={totalPropostas}
-      taxaAprovacao={taxaAprovacao}
+      totalUsuarios={totalUsuarios ?? 0}
+      totalPropostas={totalPropostas ?? 0}
+      taxaAprovacao={taxaAprovacaoNum}
       valorTotalPlataforma={valorTotalPlataforma}
       aprovadas={aprovadas}
       pendentes={pendentes}
