@@ -1,123 +1,89 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { createClient, createServiceRoleClient } from "@/lib/supabase/server";
-import { propostaSchema } from "@/lib/proposal-schema";
-import { validateProposalReferences } from "@/lib/proposal-references";
+import { getAdminContext } from "@/lib/admin-server";
+import { isAdminIdentity } from "@/lib/admin-policy";
+import type { PlanTier } from "@/types/database";
 
-const statusSchema = z.object({ status: z.enum(["rascunho", "enviada", "aprovada", "recusada", "expirada"]) });
-type RouteContext = { params: Promise<{ id: string }> };
+const requestSchema = z.object({
+  plan: z.enum(["gratuito", "pro", "premium"]),
+  reason: z.string().trim().min(3).max(500)
+});
 
-export async function PATCH(request: Request, { params }: RouteContext) {
+export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
+  const context = await getAdminContext();
+  console.log("POST /plan chamado, contexto:", !!context);
+
+  if (!context) return NextResponse.json({ erro: "Acesso não autorizado." }, { status: 403 });
+
   const { id } = await params;
-  const supabase = await createClient();
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return NextResponse.json({ erro: "Não autenticado." }, { status: 401 });
+  const parsedId = z.string().uuid().safeParse(id);
+  if (!parsedId.success) return NextResponse.json({ erro: "Usuário inválido." }, { status: 400 });
 
-  const corpo = await request.json().catch(() => null);
-  const resultado = statusSchema.safeParse(corpo);
-  if (!resultado.success) return NextResponse.json({ erro: "Status inválido." }, { status: 400 });
+  const body = await request.json().catch(() => null);
+  const parsedBody = requestSchema.safeParse(body);
+  if (!parsedBody.success) return NextResponse.json({ erro: "Plano ou justificativa inválidos." }, { status: 400 });
 
-  const { data: proposta } = await supabase.from("proposals").select("id").eq("id", id).eq("user_id", user.id).maybeSingle();
-  if (!proposta) return NextResponse.json({ erro: "Proposta não encontrada." }, { status: 404 });
-
-  const supabaseAdmin = createServiceRoleClient();
-  const { error } = await supabaseAdmin.from("proposals").update({ status: resultado.data.status }).eq("id", proposta.id);
-  if (error) return NextResponse.json({ erro: "Não foi possível atualizar o status." }, { status: 500 });
-
-  const { error: erroEvento } = await supabaseAdmin
-    .from("proposal_events")
-    .insert({ proposal_id: proposta.id, tipo: resultado.data.status });
-  if (erroEvento) return NextResponse.json({ erro: "Não foi possível registrar a alteração." }, { status: 500 });
-
-  return NextResponse.json({ id: proposta.id, status: resultado.data.status });
-}
-
-export async function PUT(request: Request, { params }: RouteContext) {
-  const { id } = await params;
-  const supabase = await createClient();
-  const {
-    data: { user }
-  } = await supabase.auth.getUser();
-  if (!user) return NextResponse.json({ erro: "Não autenticado." }, { status: 401 });
-
-  const corpo = await request.json().catch(() => null);
-  const resultado = propostaSchema.safeParse(corpo);
-  if (!resultado.success) {
-    return NextResponse.json({ erro: resultado.error.issues[0]?.message ?? "Dados inválidos." }, { status: 400 });
-  }
-  const dados = resultado.data;
-
-  const erroReferencias = await validateProposalReferences(supabase, user.id, dados.clienteId, dados.templateId);
-  if (erroReferencias) {
-    const status = erroReferencias === "client_not_owned" || erroReferencias === "template_unavailable" ? 400 : 500;
-    return NextResponse.json({ erro: "Cliente ou modelo inválido para esta conta." }, { status });
+  const { data: targetResult, error: targetError } = await context.admin.auth.admin.getUserById(parsedId.data);
+  if (targetError || !targetResult.user) return NextResponse.json({ erro: "Usuário não encontrado." }, { status: 404 });
+  if (isAdminIdentity(targetResult.user)) {
+    return NextResponse.json({ erro: "Não é permitido alterar o plano de uma conta administrativa." }, { status: 403 });
   }
 
-  const { data: proposta } = await supabase.from("proposals").select("id").eq("id", id).eq("user_id", user.id).single();
-  if (!proposta) return NextResponse.json({ erro: "Proposta não encontrada." }, { status: 404 });
+  console.log("Tentando upsert em admin_plan_grants para user:", parsedId.data);
 
-  const supabaseAdmin = createServiceRoleClient();
-  const { error: erroAtualizacao } = await supabaseAdmin
-    .from("proposals")
-    .update({
-      client_id: dados.clienteId || null,
-      template_id: dados.templateId || null,
-      nome_projeto: dados.nomeProjeto,
-      cliente_nome: dados.clienteNome,
-      cliente_email: dados.clienteEmail || null,
-      cliente_telefone: dados.clienteTelefone || null,
-      data_emissao: dados.dataEmissao,
-      validade_dias: dados.validadeDias,
-      prazo_execucao: dados.prazoExecucao || null,
-      data_entrega_prevista: dados.dataEntregaPrevista || null,
-      condicoes_pagamento: dados.condicoesPagamento || null,
-      numero_parcelas: dados.numeroParcelas,
-      entrada_valor: dados.entradaValor,
-      garantias: dados.garantias || null,
-      observacoes: dados.observacoes || null,
-      escopo: dados.escopo || null,
-      itens_nao_inclusos: dados.itensNaoInclusos || null,
-      cor_tema: dados.corTema,
-      assinatura_nome: dados.assinaturaNome || null,
-      assinatura_cargo: dados.assinaturaCargo || null,
-      taxas: dados.taxas
-    })
-    .eq("id", id);
-  if (erroAtualizacao) return NextResponse.json({ erro: "Não foi possível atualizar a proposta." }, { status: 500 });
+  // Inserir ou atualizar no admin_plan_grants
+  const { error: grantError } = await context.admin
+    .from("admin_plan_grants")
+    .upsert({
+      user_id: parsedId.data,
+      plan: parsedBody.data.plan,
+      reason: parsedBody.data.reason,
+      granted_by: context.user.id,
+      updated_at: new Date().toISOString()
+    }, { onConflict: "user_id" });
 
-  // Substitui os itens (mais simples e seguro do que fazer diff)
-  const { error: erroRemoverItens } = await supabaseAdmin.from("proposal_items").delete().eq("proposal_id", id);
-  if (erroRemoverItens) return NextResponse.json({ erro: "Não foi possível atualizar os serviços." }, { status: 500 });
+  if (grantError) {
+    console.error("admin_plan_grants upsert error:", grantError);
+    return NextResponse.json({ erro: "Não foi possível alterar o plano." }, { status: 500 });
+  }
 
-  const { error: erroInserirItens } = await supabaseAdmin.from("proposal_items").insert(
-    dados.itens.map((item, ordem) => ({
-      proposal_id: id,
-      nome: item.nome,
-      descricao: item.descricao || null,
-      quantidade: item.quantidade,
-      valor_unitario: item.valorUnitario,
-      desconto: item.desconto,
-      ordem
-    }))
-  );
-  if (erroInserirItens) return NextResponse.json({ erro: "Não foi possível atualizar os serviços." }, { status: 500 });
+  console.log("Upsert em admin_plan_grants OK, atualizando profiles...");
 
-  const { error: erroEvento } = await supabaseAdmin
-    .from("proposal_events")
-    .insert({ proposal_id: id, tipo: "editada" });
-  if (erroEvento) return NextResponse.json({ erro: "Não foi possível registrar a atualização." }, { status: 500 });
+  // Atualizar o plano em profiles
+  const { error: profileError } = await context.admin
+    .from("profiles")
+    .update({ plano: parsedBody.data.plan })
+    .eq("id", parsedId.data);
 
-  return NextResponse.json({ id });
-}
+  if (profileError) {
+    console.error("profiles update error:", profileError);
+    return NextResponse.json({ erro: "Não foi possível alterar o plano." }, { status: 500 });
+  }
 
-export async function DELETE(_request: Request, { params }: RouteContext) {
-  const { id } = await params;
-  const supabase = await createClient();
-  const {
-    data: { user }
-  } = await supabase.auth.getUser();
-  if (!user) return NextResponse.json({ erro: "Não autenticado." }, { status: 401 });
+  console.log("Update em profiles OK, registrando em audit logs...");
 
-  await supabase.from("proposals").delete().eq("id", id).eq("user_id", user.id);
-  return NextResponse.json({ ok: true });
+  // Registrar em audit logs
+  const { error: auditError } = await context.admin
+    .from("admin_audit_logs")
+    .insert({
+      actor_user_id: context.user.id,
+      target_user_id: parsedId.data,
+      action: "plan_changed",
+      details: {
+        requested_plan: parsedBody.data.plan,
+        effective_plan: parsedBody.data.plan,
+        reason: parsedBody.data.reason
+      }
+    });
+
+  if (auditError) {
+    console.error("admin_audit_logs insert error:", auditError);
+    // Não retorna erro aqui, pois o plano já foi alterado
+  }
+
+  console.log("Operação concluída com sucesso!");
+
+  const effectivePlan = parsedBody.data.plan;
+
+  return NextResponse.json({ ok: true, plan: parsedBody.data.plan, effectivePlan });
 }

@@ -11,6 +11,8 @@ const requestSchema = z.object({
 
 export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
   const context = await getAdminContext();
+  console.log("POST /plan chamado, contexto:", !!context);
+
   if (!context) return NextResponse.json({ erro: "Acesso não autorizado." }, { status: 403 });
 
   const { id } = await params;
@@ -27,13 +29,60 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     return NextResponse.json({ erro: "Não é permitido alterar o plano de uma conta administrativa." }, { status: 403 });
   }
 
-  const { data: effectivePlan, error } = await context.admin.rpc("set_admin_plan_grant", {
-    p_actor_user_id: context.user.id,
-    p_target_user_id: parsedId.data,
-    p_plan: parsedBody.data.plan as PlanTier,
-    p_reason: parsedBody.data.reason
-  });
-  if (error) return NextResponse.json({ erro: "Não foi possível alterar o plano." }, { status: 500 });
+  console.log("Tentando upsert em admin_plan_grants para user:", parsedId.data);
+
+  // Inserir ou atualizar no admin_plan_grants
+  const { error: grantError } = await context.admin
+    .from("admin_plan_grants")
+    .upsert({
+      user_id: parsedId.data,
+      plan: parsedBody.data.plan,
+      reason: parsedBody.data.reason,
+      granted_by: context.user.id,
+      updated_at: new Date().toISOString()
+    }, { onConflict: "user_id" });
+
+  if (grantError) {
+    console.error("admin_plan_grants upsert error:", grantError);
+    return NextResponse.json({ erro: "Não foi possível alterar o plano." }, { status: 500 });
+  }
+
+  console.log("Upsert em admin_plan_grants OK, atualizando profiles...");
+
+  // Atualizar o plano em profiles
+  const { error: profileError } = await context.admin
+    .from("profiles")
+    .update({ plano: parsedBody.data.plan })
+    .eq("id", parsedId.data);
+
+  if (profileError) {
+    console.error("profiles update error:", profileError);
+    return NextResponse.json({ erro: "Não foi possível alterar o plano." }, { status: 500 });
+  }
+
+  console.log("Update em profiles OK, registrando em audit logs...");
+
+  // Registrar em audit logs
+  const { error: auditError } = await context.admin
+    .from("admin_audit_logs")
+    .insert({
+      actor_user_id: context.user.id,
+      target_user_id: parsedId.data,
+      action: "plan_changed",
+      details: {
+        requested_plan: parsedBody.data.plan,
+        effective_plan: parsedBody.data.plan,
+        reason: parsedBody.data.reason
+      }
+    });
+
+  if (auditError) {
+    console.error("admin_audit_logs insert error:", auditError);
+  }
+
+  console.log("Operação concluída com sucesso!");
+
+  const effectivePlan = parsedBody.data.plan;
 
   return NextResponse.json({ ok: true, plan: parsedBody.data.plan, effectivePlan });
 }
